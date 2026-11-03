@@ -2,35 +2,228 @@ name: Oilseed prices
 
 on:
   workflow_dispatch:
+  schedule:
+    - cron: '12 11 * * *'
 
-permissions: {}
+permissions:
+  contents: write
+
+concurrency:
+  group: worldgrain-oilseed-prices
+  cancel-in-progress: false
 
 jobs:
   prices:
     runs-on: ubuntu-latest
-    timeout-minutes: 3
+    timeout-minutes: 5
     steps:
-      - name: Inspect oilseed price cards
+      - name: Prepare oilseed prices
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
         run: |
           python3 - <<'PY'
+          import base64
+          import json
+          import os
           import re
-          import urllib.request
+          from datetime import datetime
+          from decimal import Decimal
+          from html.parser import HTMLParser
+          from urllib.error import HTTPError
+          from urllib.parse import urlencode
+          from urllib.request import Request, urlopen
+          from zoneinfo import ZoneInfo
 
-          request = urllib.request.Request(
-              "https://astontd.ru/",
-              headers={"User-Agent": "WorldgrainPrices/1.0"},
-          )
-          with urllib.request.urlopen(request, timeout=30) as response:
+          SOURCE = "https://astontd.ru/"
+          POSITIONS = {
+              "podsolnechnik_2026-desc-aston_povolzhe_buzuluk":
+                  "Подсолнечник · Бузулук",
+              "raps-desc-aston_g_morozovsk":
+                  "Рапс · Морозовск",
+          }
+
+          class PricePage(HTMLParser):
+              def __init__(self):
+                  super().__init__()
+                  self.header = []
+                  self.header_depth = 0
+                  self.row = None
+                  self.cell = None
+                  self.cell_id = ""
+                  self.prices = {}
+
+              def handle_starttag(self, tag, attrs):
+                  attributes = dict(attrs)
+                  if tag == "div":
+                      classes = (attributes.get("class") or "").split()
+                      if self.header_depth or "pricelist-header-text" in classes:
+                          self.header_depth += 1
+                  if tag == "tr":
+                      self.row = []
+                  if tag == "td" and self.row is not None:
+                      self.cell = []
+                      self.cell_id = attributes.get("data-id") or ""
+
+              def handle_data(self, text):
+                  if self.header_depth:
+                      self.header.append(text)
+                  if self.cell is not None:
+                      self.cell.append(text)
+
+              def handle_endtag(self, tag):
+                  if tag == "div" and self.header_depth:
+                      self.header_depth -= 1
+                  if tag == "td" and self.cell is not None:
+                      value = " ".join("".join(self.cell).split())
+                      self.row.append((self.cell_id, value))
+                      self.cell = None
+                  if tag == "tr" and self.row is not None:
+                      without_vat = any(
+                          value.casefold() == "без ндс" for _, value in self.row
+                      )
+                      if without_vat:
+                          for key, value in self.row:
+                              if key not in POSITIONS:
+                                  continue
+                              if re.fullmatch(r"\d{1,3}(?:[,.]\d{1,3})?", value):
+                                  per_tonne = Decimal(value.replace(",", ".")) * 1000
+                                  self.prices.setdefault(key, set()).add(int(per_tonne))
+                      self.row = None
+
+          def fetch_json(url, method="GET", headers=None, payload=None):
+              headers = dict(headers or {})
+              body = None
+              if payload is not None:
+                  body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+                  headers["Content-Type"] = "application/json"
+              request = Request(url, data=body, headers=headers, method=method)
+              with urlopen(request, timeout=30) as response:
+                  return json.load(response)
+
+          request = Request(SOURCE, headers={"User-Agent": "WorldgrainPrices/1.0"})
+          with urlopen(request, timeout=30) as response:
+              raw = response.read(6_000_001)
               encoding = response.headers.get_content_charset() or "utf-8"
-              html = response.read(6_000_000).decode(encoding)
+          if len(raw) > 6_000_000:
+              raise SystemExit("Страница прайса превысила лимит размера.")
 
-          for pattern in (r"Прайс.{0,15}лист\s+действует", r"23[,.]50", r"26[,.]00"):
-              matches = list(re.finditer(pattern, html, re.IGNORECASE))
-              if not matches:
-                  print(f"Совпадений нет: {pattern}")
-                  continue
-              for match in matches[-2:]:
-                  start = max(0, match.start() - 350)
-                  print(html[start:match.end() + 350])
-                  print()
+          parser = PricePage()
+          parser.feed(raw.decode(encoding))
+          parser.close()
+          header = " ".join(" ".join(parser.header).split())
+
+          stamp = re.search(
+              r"Прайс[-‑–—\s]*лист\s+действует\s+с\s+"
+              r"(\d{2}\.\d{2}\.\d{4})\s+с\s+(\d{2}:\d{2})",
+              header, re.IGNORECASE,
+          )
+          terms = re.search(
+              r"Базис поставки\s*[-–—:]\s*CPT\b.*?"
+              r"Цены без НДС\s*[-–—:]\s*в руб\.?,?\s*за 1 кг\b",
+              header, re.IGNORECASE,
+          )
+          if not stamp or not terms:
+              raise SystemExit("Не удалось подтвердить дату, CPT или единицы прайса.")
+
+          date_label, time_label = stamp.groups()
+          price_date = datetime.strptime(date_label, "%d.%m.%Y").date()
+          today = datetime.now(ZoneInfo("Europe/Saratov")).date()
+          if price_date > today:
+              print("Прайс вступает в силу позже. Выпуск пропущен.")
+              raise SystemExit(0)
+
+          prices = {}
+          for key in POSITIONS:
+              values = parser.prices.get(key, set())
+              if len(values) == 1:
+                  prices[key] = next(iter(values))
+              elif len(values) > 1:
+                  raise SystemExit(f"Для позиции {key} найдены разные цены.")
+              else:
+                  print(f"Цена не найдена: {POSITIONS[key]}.")
+
+          if not prices:
+              raise SystemExit("Ни одна закупочная цена не распознана.")
+
+          lines = [
+              "🌻 Закупочные цены на масличные",
+              "",
+              f"Прайс действует с {date_label}, {time_label} по данным прайса.",
+              "",
+          ]
+          for key, amount in prices.items():
+              formatted = f"{amount:,}".replace(",", " ")
+              lines.append(f"• {POSITIONS[key]} — {formatted} ₽/т")
+          lines += ["", "Базис CPT. Цены без НДС.", "", "#Масличные #Цены"]
+          message = "\n".join(lines)
+
+          print(f"Прайс для сверки: {SOURCE}#price")
+          event = os.environ["GITHUB_EVENT_NAME"]
+          if event == "workflow_dispatch":
+              print(message)
+              raise SystemExit(0)
+
+          if event != "schedule" or os.environ["GITHUB_RUN_ATTEMPT"] != "1":
+              raise SystemExit(0)
+
+          token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+          if not token:
+              raise SystemExit("Отсутствует секрет TELEGRAM_BOT_TOKEN.")
+
+          branch = os.environ["GITHUB_REF_NAME"]
+          state_url = (
+              f'{os.environ["GITHUB_API_URL"]}/repos/{os.environ["GITHUB_REPOSITORY"]}'
+              "/contents/.worldgrain-oilseed-prices.json"
+          )
+          headers = {
+              "Authorization": "Bearer " + os.environ["GH_TOKEN"],
+              "Accept": "application/vnd.github+json",
+          }
+          state = {}
+          sha = None
+          try:
+              stored = fetch_json(
+                  state_url + "?" + urlencode({"ref": branch}), headers=headers
+              )
+              sha = stored["sha"]
+              state = json.loads(base64.b64decode(stored["content"]))
+          except HTTPError as error:
+              if error.code != 404:
+                  raise SystemExit(f"GitHub вернул HTTP {error.code}.") from None
+
+          if all(state.get(key) == value for key, value in prices.items()):
+              print("Цены совпадают с предыдущим выпуском.")
+              raise SystemExit(0)
+
+          state.update(prices)
+          update = {
+              "branch": branch,
+              "message": "Update Worldgrain oilseed price history",
+              "content": base64.b64encode(
+                  json.dumps(state, indent=2).encode("utf-8")
+              ).decode("ascii"),
+          }
+          if sha:
+              update["sha"] = sha
+          fetch_json(state_url, method="PUT", headers=headers, payload=update)
+
+          try:
+              result = fetch_json(
+                  f"https://api.telegram.org/bot{token}/sendMessage",
+                  method="POST",
+                  payload={
+                      "chat_id": "@worldgrain",
+                      "text": message,
+                      "disable_notification": True,
+                  },
+              )
+          except HTTPError as error:
+              raise SystemExit(f"Telegram вернул HTTP {error.code}.") from None
+          except Exception:
+              raise SystemExit("Telegram не подтвердил отправку. Проверь канал.") from None
+
+          if not result.get("ok"):
+              raise SystemExit("Telegram отклонил публикацию.")
+          print(f'Опубликован пост №{result["result"]["message_id"]}')
           PY
