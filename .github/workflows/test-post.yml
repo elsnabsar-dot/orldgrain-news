@@ -1,0 +1,52 @@
+name: Test post
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Send test post
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import sys
+          import urllib.request
+          import urllib.error
+
+          token = os.environ["TELEGRAM_BOT_TOKEN"].strip()
+          body = json.dumps({
+              "chat_id": "@worldgrain",
+              "text": "Первый зерновой: проверка публикации с GitHub.",
+              "disable_notification": True
+          }).encode("utf-8")
+
+          request = urllib.request.Request(
+              "https://api.telegram.org/bot" + token + "/sendMessage",
+              data=body,
+              headers={"Content-Type": "application/json"}
+          )
+
+          try:
+              with urllib.request.urlopen(request, timeout=30) as response:
+                  result = json.load(response)
+          except urllib.error.HTTPError as error:
+              print("ERROR: HTTP", error.code)
+              sys.exit(1)
+          except Exception:
+              print("ERROR: Connection failed; check channel before retrying")
+              sys.exit(1)
+
+          if not result.get("ok"):
+              print("ERROR: Telegram rejected the request")
+              sys.exit(1)
+
+          print("SUCCESS: Published post", result["result"]["message_id"])
+          PY
