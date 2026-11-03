@@ -1,0 +1,44 @@
+name: Pulse prices
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Inspect chickpea and lentil listings
+        run: |
+          python3 - <<'PY'
+          import re
+          from urllib.request import Request, urlopen
+
+          source = "https://agroru.com/doska/zerno-zernobobovye/rg-66913-p1.htm"
+          request = Request(source, headers={"User-Agent": "Mozilla/5.0"})
+
+          with urlopen(request, timeout=30) as response:
+              encoding = response.headers.get_content_charset() or "utf-8"
+              html = response.read(4_000_001).decode(encoding, errors="replace")
+              print(f"HTTP {response.status} | {len(html)} символов")
+
+          html = re.sub(
+              r"<(?:script|style)\b[^>]*>.*?</(?:script|style)\s*>",
+              "", html, flags=re.IGNORECASE | re.DOTALL,
+          )
+          html = re.sub(r"\s+", " ", html)
+
+          for crop, pattern in (
+              ("Нут", r">\s*[^<>]{0,70}\bнут(?:а|ом)?\b[^<>]{0,100}<"),
+              ("Чечевица", r">\s*[^<>]{0,70}\bчечевиц[ауыей]\b[^<>]{0,100}<"),
+          ):
+              matches = list(re.finditer(pattern, html, re.IGNORECASE))
+              print(f"\n{crop} — найдено фрагментов: {len(matches)}")
+              for match in matches[:4]:
+                  start = max(0, match.start() - 450)
+                  end = match.end() + 650
+                  print(html[start:end])
+                  print("---")
+          PY
