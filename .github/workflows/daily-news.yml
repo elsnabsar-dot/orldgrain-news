@@ -5,18 +5,28 @@ on:
   schedule:
     - cron: '17 5 * * *'
 
-permissions: {}
+permissions:
+  contents: read
+
+concurrency:
+  group: worldgrain-daily-news
+  cancel-in-progress: false
 
 jobs:
   digest:
     runs-on: ubuntu-latest
     timeout-minutes: 3
+    permissions:
+      contents: write
     steps:
       - name: Prepare grain news
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           python3 - <<'PY'
+          import base64
+          import hashlib
           import json
           import os
           import re
@@ -25,6 +35,7 @@ jobs:
           import xml.etree.ElementTree as ET
           from datetime import datetime, timedelta
           from html.parser import HTMLParser
+          from urllib.parse import urlsplit
           from zoneinfo import ZoneInfo
 
           class PlainText(HTMLParser):
@@ -45,8 +56,7 @@ jobs:
               sowing = re.fullmatch(
                   r"На (\d{1,2} [а-яё]+) озимыми в (?:РФ|России) засеяно "
                   r"(\d+(?:[,.]\d+)?) млн га",
-                  title,
-                  re.IGNORECASE,
+                  title, re.IGNORECASE,
               )
               if sowing:
                   day, area = sowing.groups()
@@ -62,8 +72,7 @@ jobs:
 
               harvest = re.fullmatch(
                   r"В (?:РФ|России) собрано (\d+(?:[,.]\d+)?) млн тонн зерна",
-                  title,
-                  re.IGNORECASE,
+                  title, re.IGNORECASE,
               )
               if harvest:
                   volume = harvest.group(1).replace(".", ",")
@@ -83,27 +92,54 @@ jobs:
                   r"(за \d{1,2} (?:месяц|месяца|месяцев) \d{4} года|"
                   r"в (?:январе|феврале|марте|апреле|мае|июне|июле|августе|"
                   r"сентябре|октябре|ноябре|декабре) \d{4} года)",
-                  title,
-                  re.IGNORECASE,
+                  title, re.IGNORECASE,
               )
               if export:
                   amount, unit, crop, period = export.groups()
                   amount = amount.replace(".", ",")
                   unit = "тыс." if unit.lower().startswith("тыс") else "млн"
                   crop = crop.lower()
-                  period = period.lower()
                   return (
                       f"🚢 Экспорт {crop} из России — {amount} {unit} тонн\n\n"
                       f"Россия экспортировала {amount} {unit} тонн {crop} "
-                      f"{period}.\n\n"
+                      f"{period.lower()}.\n\n"
                       "#Экспорт #Россия"
                   )
 
               return None
 
+          def request_json(url, *, headers, method="GET", payload=None):
+              data = None
+              if payload is not None:
+                  data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+                  headers = {**headers, "Content-Type": "application/json"}
+              request = urllib.request.Request(
+                  url, data=data, headers=headers, method=method,
+              )
+              with urllib.request.urlopen(request, timeout=30) as response:
+                  return json.load(response)
+
           preview = os.environ["GITHUB_EVENT_NAME"] == "workflow_dispatch"
           today = datetime.now(ZoneInfo("Europe/Saratov")).date()
-          yesterday = today - timedelta(days=1)
+          earliest = today - timedelta(days=2)
+          state_url = (
+              f'{os.environ["GITHUB_API_URL"]}/repos/{os.environ["GITHUB_REPOSITORY"]}'
+              "/contents/.worldgrain-history.json"
+          )
+          github_headers = {
+              "Authorization": "Bearer " + os.environ["GH_TOKEN"],
+              "Accept": "application/vnd.github+json",
+          }
+
+          state_sha = None
+          history = {}
+          try:
+              state = request_json(state_url + "?ref=main", headers=github_headers)
+              state_sha = state["sha"]
+              history = json.loads(base64.b64decode(state["content"]))
+          except urllib.error.HTTPError as error:
+              if error.code != 404:
+                  raise SystemExit(f"GitHub не прочитал журнал: HTTP {error.code}.") from None
 
           feed_request = urllib.request.Request(
               "https://www.zerno.ru/rss.xml",
@@ -120,54 +156,78 @@ jobs:
               except ValueError:
                   continue
 
-              if preview:
-                  if not today - timedelta(days=7) <= item_date <= today:
-                      continue
-              elif item_date != yesterday:
+              if not earliest <= item_date <= today:
                   continue
 
-              title = clean_title(item.findtext("title", ""))
-              post = editorial_post(title, date_label)
+              parsed = urlsplit(item.findtext("link", "").strip())
+              if parsed.scheme != "https" or parsed.hostname not in {"zerno.ru", "www.zerno.ru"}:
+                  continue
+              if not re.fullmatch(r"/node/\d+/?", parsed.path):
+                  continue
+
+              article_url = "https://www.zerno.ru" + parsed.path.rstrip("/")
+              key = hashlib.sha256(article_url.encode("utf-8")).hexdigest()
+              if key in history:
+                  continue
+
+              post = editorial_post(clean_title(item.findtext("title", "")), date_label)
               if post:
-                  candidates.append((item_date, post))
+                  candidates.append((item_date, key, post))
 
           if not candidates:
-              print("Подходящих фактов за выбранный период нет.")
+              print("За последние три календарных дня новых подходящих материалов нет.")
               raise SystemExit(0)
 
-          _, message = max(candidates, key=lambda entry: entry[0])
+          item_date, key, message = max(candidates, key=lambda entry: entry[0])
           if preview:
               print(message)
               raise SystemExit(0)
 
           if os.environ["GITHUB_RUN_ATTEMPT"] != "1":
-              print("Повторная отправка пропущена.")
+              print("Повторный запуск пропущен.")
               raise SystemExit(0)
 
           token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
           if not token:
               raise SystemExit("Секрет TELEGRAM_BOT_TOKEN отсутствует.")
 
-          body = json.dumps({
-              "chat_id": "@worldgrain",
-              "text": message,
-              "disable_notification": True,
-          }).encode("utf-8")
-          request = urllib.request.Request(
-              f"https://api.telegram.org/bot{token}/sendMessage",
-              data=body,
-              headers={"Content-Type": "application/json"},
-          )
+          # Сначала резервируем материал. При обрыве связи после отправки
+          # это защищает от повторной публикации.
+          history[key] = item_date.isoformat()
+          cutoff = (today - timedelta(days=30)).isoformat()
+          history = {key: date for key, date in history.items() if date >= cutoff}
+          state_update = {
+              "branch": "main",
+              "message": "Update grain news publication history",
+              "content": base64.b64encode(json.dumps(history, indent=2).encode()).decode(),
+          }
+          if state_sha:
+              state_update["sha"] = state_sha
 
           try:
-              with urllib.request.urlopen(request, timeout=30) as response:
-                  result = json.load(response)
+              request_json(
+                  state_url, headers=github_headers, method="PUT", payload=state_update,
+              )
+          except urllib.error.HTTPError as error:
+              raise SystemExit(
+                  f"GitHub не сохранил журнал: HTTP {error.code}. Публикация отменена."
+              ) from None
+
+          try:
+              result = request_json(
+                  f"https://api.telegram.org/bot{token}/sendMessage",
+                  headers={},
+                  method="POST",
+                  payload={
+                      "chat_id": "@worldgrain",
+                      "text": message,
+                      "disable_notification": True,
+                  },
+              )
           except urllib.error.HTTPError as error:
               raise SystemExit(f"Telegram вернул HTTP {error.code}.") from None
           except Exception:
-              raise SystemExit(
-                  "Ошибка связи. Проверь канал перед повторной отправкой."
-              ) from None
+              raise SystemExit("Telegram не подтвердил отправку. Проверь канал.") from None
 
           if not result.get("ok"):
               raise SystemExit("Telegram отклонил публикацию.")
