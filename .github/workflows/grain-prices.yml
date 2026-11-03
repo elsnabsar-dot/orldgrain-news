@@ -95,7 +95,15 @@ jobs:
               re.IGNORECASE,
           )
           if not table:
-              raise SystemExit("Таблица НТБ не распознана. Проверь формат страницы.")
+              marker = re.search(r"НЗТ|НКХП|пшеница|котировки", page, re.IGNORECASE)
+              if marker:
+                  start = max(0, marker.start() - 200)
+                  print("Фрагмент страницы НТБ:")
+                  print(page[start:start + 2500])
+              else:
+                  print("Начало ответа НТБ:")
+                  print(page[:1200])
+              raise SystemExit("Таблица НТБ не распознана.")
 
           stamp = re.search(
               r"Последнее обновление\s*:\s*(\d{2}\.\d{2}\.\d{4})",
