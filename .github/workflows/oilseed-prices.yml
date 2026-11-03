@@ -2,117 +2,35 @@ name: Oilseed prices
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: '12 11 * * *'
 
-permissions:
-  contents: read
-
-concurrency:
-  group: worldgrain-oilseed-prices
-  cancel-in-progress: false
+permissions: {}
 
 jobs:
   prices:
     runs-on: ubuntu-latest
-    timeout-minutes: 6
-    permissions:
-      contents: write
+    timeout-minutes: 3
     steps:
-      - name: Prepare oilseed prices
-        env:
-          GH_TOKEN: ${{ github.token }}
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      - name: Inspect oilseed price cards
         run: |
           python3 - <<'PY'
-          import base64
-          import json
-          import os
           import re
-          import urllib.error
           import urllib.request
-          from datetime import datetime
-          from decimal import Decimal
-          from html.parser import HTMLParser
-          from urllib.parse import urlencode
-          from zoneinfo import ZoneInfo
-
-          SOURCE = "https://astontd.ru/"
-
-          class PricePage(HTMLParser):
-              def __init__(self):
-                  super().__init__()
-                  self.parts = []
-                  self.hidden = None
-
-              def handle_starttag(self, tag, attrs):
-                  if tag in {"script", "style"}:
-                      self.hidden = tag
-
-              def handle_endtag(self, tag):
-                  if tag == self.hidden:
-                      self.hidden = None
-
-              def handle_data(self, data):
-                  if self.hidden is None and data.strip():
-                      self.parts.append(" ".join(data.split()))
-
-          def fetch_json(url, headers, payload=None):
-              body = None
-              method = "GET"
-              if payload is not None:
-                  body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-                  headers = {**headers, "Content-Type": "application/json"}
-                  method = "POST" if url.endswith("/sendMessage") else "PUT"
-              request = urllib.request.Request(
-                  url, data=body, headers=headers, method=method
-              )
-              with urllib.request.urlopen(request, timeout=30) as response:
-                  return json.load(response)
 
           request = urllib.request.Request(
-              SOURCE, headers={"User-Agent": "WorldgrainPrices/1.0"}
+              "https://astontd.ru/",
+              headers={"User-Agent": "WorldgrainPrices/1.0"},
           )
           with urllib.request.urlopen(request, timeout=30) as response:
               encoding = response.headers.get_content_charset() or "utf-8"
-              parser = PricePage()
-              parser.feed(response.read(6_000_000).decode(encoding))
-              parser.close()
+              html = response.read(6_000_000).decode(encoding)
 
-          page = " ".join(parser.parts)
-          stamp = re.search(
-              r"Прайс[\s‑–-]*лист\s+действует\s+с\s+(\d{2}\.\d{2}\.\d{4})",
-              page, re.IGNORECASE,
-          )
-          if not stamp:
-              raise SystemExit("На странице не найдена дата действия прайса.")
-
-          section = page[stamp.end():]
-          terms = section[:1200]
-          if not re.search(r"Базис\s+поставки\s*[-–—:]?\s*CPT\b", terms, re.I):
-              raise SystemExit("Не удалось подтвердить базис CPT.")
-          if not re.search(r"Цены\s+без\s+НДС\b.{0,70}за\s+1\s*кг", terms, re.I):
-              raise SystemExit("Не удалось подтвердить цены в рублях за кг без НДС.")
-
-          price_date = datetime.strptime(stamp.group(1), "%d.%m.%Y").date()
-          today = datetime.now(ZoneInfo("Europe/Saratov")).date()
-          if price_date > today:
-              print("Прайс ещё не вступил в силу.")
-              raise SystemExit(0)
-
-          # Для каждой позиции связываем цену с ближайшим заголовком
-          # пункта приёмки и проверяем название культуры.
-          heading = re.compile(
-              r"<h([234])\b[^>]*>(.*?)</h\1\s*>",
-              re.IGNORECASE | re.DOTALL,
-          )
-
-          def plain(fragment):
-              reader = PricePage()
-              reader.feed(fragment)
-              reader.close()
-              return " ".join(reader.parts)
-
-          # Повторно используем HTML из того же ответа.
-          # Карточки цен содержат отдельные заголовки пункта и культуры.
+          for pattern in (r"Прайс.{0,15}лист\s+действует", r"23[,.]50", r"26[,.]00"):
+              matches = list(re.finditer(pattern, html, re.IGNORECASE))
+              if not matches:
+                  print(f"Совпадений нет: {pattern}")
+                  continue
+              for match in matches[-2:]:
+                  start = max(0, match.start() - 350)
+                  print(html[start:match.end() + 350])
+                  print()
           PY
