@@ -29,7 +29,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
         run: |
-          "$RUNNER_TEMP/worldgrain-pulses/bin/python" - <<'PY'
+          cat > "$RUNNER_TEMP/pulse-prices.py" <<'PY'
           import base64
           import hashlib
           import json
@@ -44,27 +44,40 @@ jobs:
 
           from bs4 import BeautifulSoup
 
-          SOURCE = "https://agroru.com/doska/zerno-zernobobovye/rg-66913-p1.htm"
-          today = datetime.now(ZoneInfo("Europe/Saratov")).date()
-          cutoff = today - timedelta(days=6)
 
+          BASE = "https://agroru.com"
+          SOURCES = (
+              BASE + "/doska/zerno-zernobobovye/rg-66913-p1.htm",
+              BASE + "/doska/nut/",
+              BASE + "/doska/chechevica/",
+          )
+          CARD_LINK = "a.tovar-list__card-link[href]"
           MONTHS = {
-              name: number for number, name in enumerate(
+              name: number
+              for number, name in enumerate(
                   "января февраля марта апреля мая июня июля августа "
                   "сентября октября ноября декабря".split(), 1
               )
           }
+          TODAY = datetime.now(ZoneInfo("Europe/Saratov")).date()
+          CUTOFF = TODAY - timedelta(days=6)
 
-          def clean(value):
-              return " ".join(value.split())
+
+          def clean(text):
+              return " ".join(text.split())
+
 
           def published_date(value):
-              value = value.casefold().strip()
-              if re.fullmatch(r"сегодня(?:\s+в\s+\d{1,2}:\d{2})?", value):
-                  return today
-              if re.fullmatch(r"вчера(?:\s+в\s+\d{1,2}:\d{2})?", value):
-                  return today - timedelta(days=1)
-              match = re.fullmatch(r"(\d{1,2}) ([а-яё]+) (\d{4})(?: г\.?)?", value)
+              value = clean(value).casefold()
+              relative = re.fullmatch(
+                  r"(сегодня|вчера)(?:\s+в\s+\d{1,2}:\d{2})?", value
+              )
+              if relative:
+                  return TODAY - timedelta(days=int(relative[1] == "вчера"))
+
+              match = re.fullmatch(
+                  r"(\d{1,2}) ([а-яё]+) (\d{4})(?: г\.?)?", value
+              )
               if not match or match[2] not in MONTHS:
                   return None
               try:
@@ -72,20 +85,22 @@ jobs:
               except ValueError:
                   return None
 
+
           def text_of(card, selector):
               element = card.select_one(selector)
               return clean(element.get_text(" ", strip=True)) if element else ""
 
+
           def find_card(link):
-              # Поднимаемся до контейнера одной карточки с географией и датой.
               for parent in link.parents:
                   if parent.name in {"body", "html", "[document]"}:
                       break
-                  if len(parent.select("a.tovar-list__card-link")) != 1:
+                  if len(parent.select(CARD_LINK)) != 1:
                       break
                   if parent.select_one(".tovar-list__card-meta"):
                       return parent
               return None
+
 
           def parse_offer(link):
               card = find_card(link)
@@ -97,15 +112,18 @@ jobs:
               specs = text_of(card, ".tovar-list__card-specs").casefold()
               details = f"{title} {description} {specs}"
 
-              has_chickpea = bool(re.search(r"\bнут(?:а|ом)?\b", title))
-              has_lentil = bool(re.search(r"\bчечевиц[ауыей]\b", title))
-              if has_chickpea == has_lentil:
+              chickpea = bool(re.search(r"\bнут(?:а|ом)?\b", title))
+              lentil = bool(re.search(r"\bчечевиц[ауыей]\b", title))
+              if chickpea == lentil:
                   return None
-              if re.search(r"\b(?:семена|семенной|элита|посевной)\b", title):
+              if re.search(
+                  r"\b(?:семена|семенн[а-яё]+|элита|посевн[а-яё]+)\b", title
+              ):
                   return None
 
-              crop = "Нут" if has_chickpea else "Чечевица"
-              if has_lentil:
+              culture = "Нут" if chickpea else "Чечевица"
+              crop = culture
+              if lentil:
                   red = bool(re.search(r"\bкрасн[а-яё]+\b", details))
                   green = bool(re.search(r"\bзел[её]н[а-яё]+\b", details))
                   if red != green:
@@ -115,28 +133,36 @@ jobs:
                   if calibre:
                       crop += f" {calibre[1]}"
 
-              buy = bool(re.search(r"\b(?:куплю|купим|закупаю|закупаем|покупаю|покупаем)\b", details))
-              sell = bool(re.search(r"\b(?:продам|продаём|продаем|предлагаем|предлагаю)\b|тип продаж:", details))
+              buy = bool(re.search(
+                  r"\b(?:куплю|купим|закупаю|закупаем|покупаю|покупаем)\b",
+                  details,
+              ))
+              sell = bool(re.search(
+                  r"\b(?:продам|продадим|продаём|продаем|предлагаем|предлагаю)\b"
+                  r"|тип продаж:",
+                  details,
+              ))
               if buy == sell:
                   return None
-              side = "Закупка" if buy else "Продажа"
 
               location, separator, date_text = text_of(
                   card, ".tovar-list__card-meta"
               ).rpartition("·")
-              if not separator:
-                  return None
               location = location.strip()
-              if not re.match(r"^Саратовская область(?:,|$)", location, re.I):
+              if not separator or not re.match(
+                  r"^Саратовская область(?:,|$)", location, re.I
+              ):
                   return None
+
               posted = published_date(date_text)
-              if posted is None or not cutoff <= posted <= today:
+              if posted is None or not CUTOFF <= posted <= TODAY:
                   return None
               city = location.partition(",")[2].strip() or "Саратовская область"
 
               price = re.fullmatch(
                   r"(\d+(?: \d{3})*(?:[,.]\d{1,3})?)\s*₽\s*/\s*(кг|т)",
-                  text_of(card, ".tovar-list__card-price"), re.I,
+                  text_of(card, ".tovar-list__card-price"),
+                  re.I,
               )
               if not price:
                   return None
@@ -146,23 +172,20 @@ jobs:
               if amount <= 0 or amount != amount.to_integral_value():
                   return None
 
-              vat = ""
-              if re.search(r"\bбез\s*ндс\b", description):
-                  vat = "без НДС"
-              elif re.search(r"\bс\s*ндс\b", description):
-                  vat = "с НДС"
-
               conditions = []
               if "самовывоз" in description:
                   conditions.append("самовывоз")
-              if vat:
-                  conditions.append(vat)
-              minimum = re.search(r"минимальная партия \(т\):\s*(\d+(?:[,.]\d+)?)", specs)
+              if re.search(r"\bбез\s*ндс\b", description):
+                  conditions.append("без НДС")
+              elif re.search(r"\bс\s*ндс\b", description):
+                  conditions.append("с НДС")
+              minimum = re.search(
+                  r"минимальная партия \(т\):\s*(\d+(?:[,.]\d+)?)", specs
+              )
               if minimum and Decimal(minimum[1].replace(",", ".")) > 0:
                   conditions.append(f"от {minimum[1]} т")
 
-              url = urljoin(SOURCE, link.get("href", ""))
-              parsed = urlsplit(url)
+              parsed = urlsplit(urljoin(BASE, link["href"]))
               if parsed.hostname not in {"agroru.com", "www.agroru.com"}:
                   return None
               if not re.fullmatch(r"/doska/[^/]+-\d+\.htm", parsed.path):
@@ -170,8 +193,9 @@ jobs:
 
               return {
                   "id": hashlib.sha256(parsed.path.encode()).hexdigest(),
-                  "url": url,
-                  "side": side,
+                  "url": BASE + parsed.path,
+                  "side": "Закупка" if buy else "Продажа",
+                  "culture": culture,
                   "crop": crop,
                   "city": city,
                   "price": int(amount),
@@ -179,160 +203,180 @@ jobs:
                   "conditions": conditions,
               }
 
-          def request_json(url, method="GET", headers=None, payload=None):
+
+          def read_offers():
+              offers = {}
+              pages_read = 0
+              for source in SOURCES:
+                  request = Request(source, headers={"User-Agent": "Mozilla/5.0"})
+                  try:
+                      with urlopen(request, timeout=25) as response:
+                          html = response.read(4_000_001)
+                  except OSError as error:
+                      print(f"Страница недоступна: {source} ({type(error).__name__})")
+                      continue
+
+                  if len(html) > 4_000_000:
+                      print(f"Страница превысила лимит размера: {source}")
+                      continue
+                  links = BeautifulSoup(html, "html.parser").select(CARD_LINK)
+                  if not links:
+                      print(f"Карточки не найдены: {source}")
+                      continue
+
+                  pages_read += 1
+                  matched = 0
+                  for link in links:
+                      offer = parse_offer(link)
+                      if offer is None:
+                          continue
+                      matched += 1
+                      previous = offers.get(offer["id"])
+                      if previous is None or offer["date"] > previous["date"]:
+                          offers[offer["id"]] = offer
+
+                  print(f"{source} — карточек: {len(links)}, прошли фильтр: {matched}")
+
+              if not pages_read:
+                  raise SystemExit("Не удалось прочитать карточки ни с одной страницы.")
+              return offers
+
+
+          def request_json(url, *, method="GET", headers=None, payload=None):
               headers = dict(headers or {})
               body = None
               if payload is not None:
                   headers["Content-Type"] = "application/json"
-                  body = json.dumps(payload, ensure_ascii=False).encode()
+                  body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
               request = Request(url, headers=headers, data=body, method=method)
               with urlopen(request, timeout=30) as response:
                   return json.load(response)
 
-                   sources = (
-              SOURCE,
-              "https://agroru.com/doska/nut/",
-              "https://agroru.com/doska/chechevica/",
-          )
-          offers = {}
-          pages_read = 0
 
-          for source in sources:
-              try:
-                  request = Request(source, headers={"User-Agent": "Mozilla/5.0"})
-                  with urlopen(request, timeout=25) as response:
-                      html = response.read(4_000_001)
-              except OSError as error:
-                  print(f"Страница недоступна: {source} ({type(error).__name__})")
-                  continue
+          def main():
+              event = os.environ["GITHUB_EVENT_NAME"]
+              preview = event == "workflow_dispatch"
+              if not preview and (
+                  event != "schedule" or os.environ["GITHUB_RUN_ATTEMPT"] != "1"
+              ):
+                  print("Отправка пропущена.")
+                  return
 
-              if len(html) > 4_000_000:
-                  print(f"Страница превысила лимит размера: {source}")
-                  continue
+              offers = read_offers()
+              branch = os.environ["GITHUB_REF_NAME"]
+              state_url = (
+                  f'{os.environ["GITHUB_API_URL"]}/repos/{os.environ["GITHUB_REPOSITORY"]}'
+                  "/contents/.worldgrain-pulse-prices.json"
+              )
+              headers = {
+                  "Authorization": "Bearer " + os.environ["GH_TOKEN"],
+                  "Accept": "application/vnd.github+json",
+              }
+              state = {}
+              sha = None
+              if not preview:
+                  try:
+                      stored = request_json(
+                          state_url + "?" + urlencode({"ref": branch}), headers=headers
+                      )
+                      sha = stored["sha"]
+                      state = json.loads(base64.b64decode(stored["content"]))
+                  except HTTPError as error:
+                      if error.code != 404:
+                          raise SystemExit(
+                              f"GitHub не прочитал журнал: HTTP {error.code}."
+                          ) from None
 
-              soup = BeautifulSoup(html, "html.parser")
-              links = soup.select("a.tovar-list__card-link[href]")
-              if not links:
-                  print(f"Карточки не найдены: {source}")
-                  continue
-
-              pages_read += 1
-              matched = 0
-              for link in links:
-                  offer = parse_offer(link)
-                  if offer:
-                      matched += 1
-                      offers.setdefault(offer["id"], offer)
-
-              print(f"{source} — карточек: {len(links)}, прошли фильтр: {matched}")
-
-          if not pages_read:
-              raise SystemExit("Не удалось прочитать карточки ни с одной страницы.")
-
-          preview = os.environ["GITHUB_EVENT_NAME"] == "workflow_dispatch"
-          if not preview and os.environ.get("GITHUB_RUN_ATTEMPT") != "1":
-              print("Повторный запуск пропущен.")
-              raise SystemExit(0)
-
-          branch = os.environ["GITHUB_REF_NAME"]
-          state_url = (
-              f'{os.environ["GITHUB_API_URL"]}/repos/{os.environ["GITHUB_REPOSITORY"]}'
-              "/contents/.worldgrain-pulse-prices.json"
-          )
-          headers = {
-              "Authorization": "Bearer " + os.environ["GH_TOKEN"],
-              "Accept": "application/vnd.github+json",
-          }
-          state = {}
-          sha = None
-          if not preview:
-              try:
-                  stored = request_json(
-                      state_url + "?" + urlencode({"ref": branch}), headers=headers
-                  )
-                  sha = stored["sha"]
-                  state = json.loads(base64.b64decode(stored["content"]))
-              except HTTPError as error:
-                  if error.code != 404:
-                      raise SystemExit(f"GitHub вернул HTTP {error.code}.") from None
-
-          candidates = [
-              offer for offer in offers.values()
-              if state.get(offer["id"], {}).get("price") != offer["price"]
-          ]
-          candidates.sort(key=lambda offer: offer["date"], reverse=True)
-
-          # Берём до двух предложений на культуру для каждой стороны рынка.
-          selected = []
-          counts = {}
-          for offer in candidates:
-              group = (offer["side"], offer["crop"].split()[0])
-              if counts.get(group, 0) < 2:
+              candidates = sorted(
+                  offers.values(), key=lambda offer: offer["date"], reverse=True
+              )
+              selected = []
+              counts = {}
+              for offer in candidates:
+                  if state.get(offer["id"], {}).get("price") == offer["price"]:
+                      continue
+                  group = (offer["side"], offer["culture"])
+                  if counts.get(group, 0) >= 2:
+                      continue
                   selected.append(offer)
                   counts[group] = counts.get(group, 0) + 1
 
-          if not selected:
-              print("Свежих предложений с явной ценой и направлением нет.")
-              raise SystemExit(0)
+              if not selected:
+                  print("Новых свежих предложений с явной ценой и направлением нет.")
+                  return
 
-          lines = [
-              "🌱 Нут и чечевица · Саратовская область",
-              "",
-              "Цены из объявлений, ₽/т.",
-          ]
-          for side in ("Закупка", "Продажа"):
-              section = [offer for offer in selected if offer["side"] == side]
-              if not section:
-                  continue
-              lines.extend(["", side])
-              for offer in section:
-                  price = f'{offer["price"]:,}'.replace(",", " ")
-                  suffix = ", ".join(offer["conditions"])
-                  if suffix:
-                      suffix = f" · {suffix}"
-                  lines.append(
-                      f'• {offer["crop"]}, {offer["city"]} — {price} ₽/т'
-                      f'{suffix} · {offer["date"]:%d.%m}'
+              cultures = {offer["culture"] for offer in selected}
+              heading = "Нут и чечевица" if len(cultures) == 2 else next(iter(cultures))
+              lines = [
+                  f"🌱 {heading} · Саратовская область",
+                  "",
+                  "Цены из объявлений, ₽/т.",
+              ]
+              for side in ("Закупка", "Продажа"):
+                  section = [offer for offer in selected if offer["side"] == side]
+                  if not section:
+                      continue
+                  lines.extend(["", side])
+                  for offer in section:
+                      price = f'{offer["price"]:,}'.replace(",", " ")
+                      details = [*offer["conditions"], offer["date"].strftime("%d.%m")]
+                      lines.append(
+                          f'• {offer["crop"]}, {offer["city"]} — {price} ₽/т'
+                          f' · {", ".join(details)}'
+                      )
+                      print(f'Для сверки: {offer["url"]}')
+
+              lines.extend(["", "#Бобовые #Цены #СаратовскаяОбласть"])
+              message = "\n".join(lines)
+              if preview:
+                  print("\n" + message)
+                  return
+              if len(message) > 4096:
+                  raise SystemExit("Выпуск превышает лимит длины Telegram.")
+
+              token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+              if not token:
+                  raise SystemExit("Отсутствует секрет TELEGRAM_BOT_TOKEN.")
+
+              for offer in selected:
+                  state[offer["id"]] = {"price": offer["price"]}
+              update = {
+                  "branch": branch,
+                  "message": "Update Worldgrain pulse price history",
+                  "content": base64.b64encode(json.dumps(state).encode()).decode(),
+              }
+              if sha:
+                  update["sha"] = sha
+              try:
+                  request_json(state_url, method="PUT", headers=headers, payload=update)
+              except HTTPError as error:
+                  raise SystemExit(
+                      f"GitHub не сохранил журнал: HTTP {error.code}."
+                  ) from None
+
+              try:
+                  result = request_json(
+                      f"https://api.telegram.org/bot{token}/sendMessage",
+                      method="POST",
+                      payload={
+                          "chat_id": "@worldgrain",
+                          "text": message,
+                          "disable_notification": True,
+                      },
                   )
-                  print(f'Для сверки: {offer["url"]}')
+              except HTTPError as error:
+                  raise SystemExit(f"Telegram вернул HTTP {error.code}.") from None
+              except Exception:
+                  raise SystemExit(
+                      "Telegram не подтвердил отправку. Проверь канал."
+                  ) from None
 
-          lines.extend(["", "#Бобовые #Цены #СаратовскаяОбласть"])
-          message = "\n".join(lines)
-          if preview:
-              print("\n" + message)
-              raise SystemExit(0)
+              if not result.get("ok"):
+                  raise SystemExit("Telegram отклонил публикацию.")
+              print(f'Опубликован пост №{result["result"]["message_id"]}')
 
-          token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
-          if not token:
-              raise SystemExit("Отсутствует секрет TELEGRAM_BOT_TOKEN.")
 
-          for offer in selected:
-              state[offer["id"]] = {"price": offer["price"]}
-          update = {
-              "branch": branch,
-              "message": "Update Worldgrain pulse price history",
-              "content": base64.b64encode(json.dumps(state).encode()).decode(),
-          }
-          if sha:
-              update["sha"] = sha
-          request_json(state_url, method="PUT", headers=headers, payload=update)
-
-          try:
-              result = request_json(
-                  f"https://api.telegram.org/bot{token}/sendMessage",
-                  method="POST",
-                  payload={
-                      "chat_id": "@worldgrain",
-                      "text": message,
-                      "disable_notification": True,
-                  },
-              )
-          except HTTPError as error:
-              raise SystemExit(f"Telegram вернул HTTP {error.code}.") from None
-          except Exception:
-              raise SystemExit("Telegram не подтвердил отправку. Проверь канал.") from None
-
-          if not result.get("ok"):
-              raise SystemExit("Telegram отклонил публикацию.")
-          print(f'Опубликован пост №{result["result"]["message_id"]}')
+          main()
           PY
+
+          "$RUNNER_TEMP/worldgrain-pulses/bin/python" "$RUNNER_TEMP/pulse-prices.py"
