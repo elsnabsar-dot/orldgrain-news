@@ -1,0 +1,91 @@
+name: Preview Agroexport pulses
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  preview:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Build Telegram preview
+        run: |
+          python3 - <<'PY'
+          import re
+          import xml.etree.ElementTree as ET
+          from datetime import datetime
+          from email.utils import parsedate_to_datetime
+          from html.parser import HTMLParser
+          from urllib.request import Request, urlopen
+          from zoneinfo import ZoneInfo
+
+
+          class ArticleText(HTMLParser):
+              def __init__(self):
+                  super().__init__()
+                  self.parts = []
+
+              def handle_data(self, data):
+                  self.parts.append(data)
+
+
+          feed = "https://aemcx.ru/feed/"
+          content_field = "{http://purl.org/rss/1.0/modules/content/}encoded"
+          saratov = ZoneInfo("Europe/Saratov")
+          today = datetime.now(saratov).date()
+          forecast = re.compile(
+              r"\bIGC\s+ожидает\s+сокращение\s+мирового\s+"
+              r"производства\s+чечевицы\b",
+              re.IGNORECASE,
+          )
+
+          request = Request(feed, headers={"User-Agent": "Mozilla/5.0"})
+          with urlopen(request, timeout=25) as response:
+              root = ET.fromstring(response.read())
+
+          items = root.findall("./channel/item")
+          if not items:
+              raise SystemExit("RSS не вернул ни одной записи.")
+
+          print(f"Записей в RSS: {len(items)}")
+          candidates = 0
+
+          for item in items:
+              parser = ArticleText()
+              parser.feed(item.findtext(content_field) or "")
+              parser.close()
+              article = " ".join(" ".join(parser.parts).split())
+              if not forecast.search(article):
+                  continue
+
+              title = " ".join((item.findtext("title") or "").split())
+              try:
+                  published = parsedate_to_datetime(item.findtext("pubDate") or "")
+                  if published.tzinfo is None:
+                      raise ValueError("Дата без часового пояса")
+                  published_day = published.astimezone(saratov).date()
+              except (ValueError, TypeError, OverflowError):
+                  print(f"Пропуск: не удалось прочитать дату | {title}")
+                  continue
+
+              age = (today - published_day).days
+              if not 0 <= age < 15:
+                  print(f"Пропуск: вне окна 15 дней | {published_day:%d.%m.%Y} | {title}")
+                  continue
+
+              candidates += 1
+              print(f"\nПубликация источника: {published_day:%d.%m.%Y}")
+              print(f"Для сверки: {item.findtext('link') or '—'}")
+              print("----- Текст для Telegram -----")
+              print(
+                  "🌱 Мировой рынок чечевицы\n\n"
+                  "Международный совет по зерну (IGC) ожидает сокращения "
+                  "мирового производства чечевицы.\n\n"
+                  "#Бобовые #Чечевица #МировойРынок"
+              )
+              print("------------------------------")
+
+          print(f"\nГотовых предпросмотров: {candidates}")
+          PY
