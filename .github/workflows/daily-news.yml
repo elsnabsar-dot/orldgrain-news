@@ -1,29 +1,29 @@
-name: Daily grain news
 
+    
+  
+name: Pulse news
+ 
 on:
-  on:
   workflow_dispatch:
   schedule:
-    - cron: '17 5,9,14 * * *'
-
+    - cron: '36 15 * * *'
+ 
 permissions:
-  contents: read
-
+  contents: write
+ 
 concurrency:
-  group: worldgrain-daily-news
+  group: worldgrain-pulse-news
   cancel-in-progress: false
-
+ 
 jobs:
-  digest:
+  news:
     runs-on: ubuntu-latest
-    timeout-minutes: 3
-    permissions:
-      contents: write
+    timeout-minutes: 5
     steps:
-      - name: Prepare grain news
+      - name: Prepare chickpea and lentil news
         env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           GH_TOKEN: ${{ github.token }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
         run: |
           python3 - <<'PY'
           import base64
@@ -31,206 +31,70 @@ jobs:
           import json
           import os
           import re
-          import urllib.error
-          import urllib.request
           import xml.etree.ElementTree as ET
           from datetime import datetime, timedelta
+          from email.utils import parsedate_to_datetime
+          from decimal import Decimal
           from html.parser import HTMLParser
-          from urllib.parse import urlsplit
+          from urllib.error import HTTPError, URLError
+          from urllib.parse import urlencode, urlsplit
+          from urllib.request import Request, urlopen
           from zoneinfo import ZoneInfo
 
-          class PlainText(HTMLParser):
+          FEED = "https://www.zerno.ru/rss.xml"
+          MONTH = (
+              r"январе|феврале|марте|апреле|мае|июне|июле|августе|"
+              r"сентябре|октябре|ноябре|декабре"
+          )
+          PERIOD = (
+              rf"(?:в (?:{MONTH}) \d{{4}} года|"
+              r"за (?:[1-9]|1[0-2]) (?:месяц|месяца|месяцев) \d{4} года)"
+          )
+          AMOUNT = r"(?P<amount>\d+(?:[,.]\d+)?)\s*(?P<scale>тыс\.?|млн)?"
+          CROP = r"(?P<crop>нута|чечевицы)"
+          TONNES = r"тонн?(?:ы)?"
+          EXPORT = re.compile(
+              rf"Россия (?:экспортировала|отгрузила на экспорт) "
+              rf"{AMOUNT}\s+{TONNES} {CROP} (?P<period>{PERIOD})",
+              re.IGNORECASE,
+          )
+          HARVEST = re.compile(
+              rf"В (?:России|РФ) (?:собрано|намолочено) "
+              rf"{AMOUNT}\s+{TONNES} {CROP}",
+              re.IGNORECASE,
+          )
+          SOWING = re.compile(
+              rf"В (?:России|РФ) (?:посеяно|засеяно) "
+              rf"{AMOUNT}\s+(?:га|гектаров) {CROP}",
+              re.IGNORECASE,
+          )
+
+          class TitleText(HTMLParser):
               def __init__(self):
                   super().__init__()
                   self.parts = []
 
-              def handle_data(self, text):
-                  self.parts.append(text)
+              def handle_data(self, data):
+                  self.parts.append(data)
 
-          def clean_title(value):
-              parser = PlainText()
-              parser.feed(value)
+          def clean_title(raw):
+              parser = TitleText()
+              parser.feed(raw)
               parser.close()
               return " ".join("".join(parser.parts).split()).rstrip(".")
 
-          def editorial_post(title, date_label):
-              sowing = re.fullmatch(
-                  r"На (\d{1,2} [а-яё]+) озимыми в (?:РФ|России) засеяно "
-                  r"(\d+(?:[,.]\d+)?) млн га",
-                  title, re.IGNORECASE,
-              )
-              if sowing:
-                  day, area = sowing.groups()
-                  area = area.replace(".", ",")
-                  return (
-                      f"🌾 Озимая посевная в России — {area} млн га\n\n"
-                      f"К {day} российские аграрии засеяли озимыми "
-                      f"{area} млн гектаров.\n\n"
-                      "Следующий ориентир — итоговая площадь сева и её "
-                      "сравнение с прошлым сезоном.\n\n"
-                      "#Посевная #Россия"
-                  )
+          def editorial_post(title, published):
+              for topic, pattern in (
+                  ("Экспорт", EXPORT),
+                  ("Урожай", HARVEST),
+                  ("Посевная", SOWING),
+              ):
+                  match = pattern.fullmatch(title)
+                  if match is None:
+                      continue
 
-              harvest = re.fullmatch(
-                  r"В (?:РФ|России) собрано (\d+(?:[,.]\d+)?) млн тонн зерна",
-                  title, re.IGNORECASE,
-              )
-              if harvest:
-                  volume = harvest.group(1).replace(".", ",")
-                  return (
-                      f"🌾 Уборка зерна в России — {volume} млн тонн\n\n"
-                      f"В сводке от {date_label} указан сбор "
-                      f"{volume} млн тонн зерна по стране.\n\n"
-                      "Для сравнения с прошлым сезоном важно сверять "
-                      "дату сводки и методику учёта.\n\n"
-                      "#Урожай #Россия"
-                  )
+                  crop = match["crop"].casefold()
+                  tag = "#Нут" if crop == "нута" else "#Чечевица"
+                  amount = Decimal(match["amount"].replace(",", "."))
+                  scale = (match["scale"] or "").casefold().rstrip(".")
 
-              export = re.fullmatch(
-                  r"Россия (?:экспортировала|отгрузила на экспорт) "
-                  r"(\d+(?:[,.]\d+)?) (тыс\.?|млн) тонн? "
-                  r"(пшеницы|ячменя|кукурузы|зерна|рапса|сои|льна|нута|чечевицы|гороха) "
-                  r"(за \d{1,2} (?:месяц|месяца|месяцев) \d{4} года|"
-                  r"в (?:январе|феврале|марте|апреле|мае|июне|июле|августе|"
-                  r"сентябре|октябре|ноябре|декабре) \d{4} года)",
-                  title, re.IGNORECASE,
-              )
-              if export:
-                  amount, unit, crop, period = export.groups()
-                  amount = amount.replace(".", ",")
-                  unit = "тыс." if unit.lower().startswith("тыс") else "млн"
-                  crop = crop.lower()
-                  return (
-                      f"🚢 Экспорт {crop} из России — {amount} {unit} тонн\n\n"
-                      f"Россия экспортировала {amount} {unit} тонн {crop} "
-                      f"{period.lower()}.\n\n"
-                      "#Экспорт #Россия"
-                  )
-
-              return None
-
-          def request_json(url, *, headers, method="GET", payload=None):
-              data = None
-              if payload is not None:
-                  data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-                  headers = {**headers, "Content-Type": "application/json"}
-              request = urllib.request.Request(
-                  url, data=data, headers=headers, method=method,
-              )
-              with urllib.request.urlopen(request, timeout=30) as response:
-                  return json.load(response)
-
-          preview = os.environ["GITHUB_EVENT_NAME"] == "workflow_dispatch"
-          today = datetime.now(ZoneInfo("Europe/Saratov")).date()
-          earliest = today - timedelta(days=2)
-          state_url = (
-              f'{os.environ["GITHUB_API_URL"]}/repos/{os.environ["GITHUB_REPOSITORY"]}'
-              "/contents/.worldgrain-history.json"
-          )
-          github_headers = {
-              "Authorization": "Bearer " + os.environ["GH_TOKEN"],
-              "Accept": "application/vnd.github+json",
-          }
-
-          state_sha = None
-          history = {}
-          try:
-              state = request_json(state_url + "?ref=main", headers=github_headers)
-              state_sha = state["sha"]
-              history = json.loads(base64.b64decode(state["content"]))
-          except urllib.error.HTTPError as error:
-              if error.code != 404:
-                  raise SystemExit(f"GitHub не прочитал журнал: HTTP {error.code}.") from None
-
-          feed_request = urllib.request.Request(
-              "https://www.zerno.ru/rss.xml",
-              headers={"User-Agent": "WorldgrainNews/1.0 (RSS reader)"},
-          )
-          with urllib.request.urlopen(feed_request, timeout=30) as response:
-              root = ET.fromstring(response.read(2_000_000))
-
-          candidates = []
-          for item in root.findall("./channel/item"):
-              date_label = item.findtext("pubDate", "").strip()
-              try:
-                  item_date = datetime.strptime(date_label, "%d.%m.%Y").date()
-              except ValueError:
-                  continue
-
-              if not earliest <= item_date <= today:
-                  continue
-
-              parsed = urlsplit(item.findtext("link", "").strip())
-              if parsed.scheme != "https" or parsed.hostname not in {"zerno.ru", "www.zerno.ru"}:
-                  continue
-              if not re.fullmatch(r"/node/\d+/?", parsed.path):
-                  continue
-
-              article_url = "https://www.zerno.ru" + parsed.path.rstrip("/")
-              key = hashlib.sha256(article_url.encode("utf-8")).hexdigest()
-              if key in history:
-                  continue
-
-              post = editorial_post(clean_title(item.findtext("title", "")), date_label)
-              if post:
-                  candidates.append((item_date, key, post))
-
-          if not candidates:
-              print("За последние три календарных дня новых подходящих материалов нет.")
-              raise SystemExit(0)
-
-          item_date, key, message = max(candidates, key=lambda entry: entry[0])
-          if preview:
-              print(message)
-              raise SystemExit(0)
-
-          if os.environ["GITHUB_RUN_ATTEMPT"] != "1":
-              print("Повторный запуск пропущен.")
-              raise SystemExit(0)
-
-          token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
-          if not token:
-              raise SystemExit("Секрет TELEGRAM_BOT_TOKEN отсутствует.")
-
-          # Сначала резервируем материал. При обрыве связи после отправки
-          # это защищает от повторной публикации.
-          history[key] = item_date.isoformat()
-          cutoff = (today - timedelta(days=30)).isoformat()
-          history = {key: date for key, date in history.items() if date >= cutoff}
-          state_update = {
-              "branch": "main",
-              "message": "Update grain news publication history",
-              "content": base64.b64encode(json.dumps(history, indent=2).encode()).decode(),
-          }
-          if state_sha:
-              state_update["sha"] = state_sha
-
-          try:
-              request_json(
-                  state_url, headers=github_headers, method="PUT", payload=state_update,
-              )
-          except urllib.error.HTTPError as error:
-              raise SystemExit(
-                  f"GitHub не сохранил журнал: HTTP {error.code}. Публикация отменена."
-              ) from None
-
-          try:
-              result = request_json(
-                  f"https://api.telegram.org/bot{token}/sendMessage",
-                  headers={},
-                  method="POST",
-                  payload={
-                      "chat_id": "@worldgrain",
-                      "text": message,
-                      "disable_notification": True,
-                  },
-              )
-          except urllib.error.HTTPError as error:
-              raise SystemExit(f"Telegram вернул HTTP {error.code}.") from None
-          except Exception:
-              raise SystemExit("Telegram не подтвердил отправку. Проверь канал.") from None
-
-          if not result.get("ok"):
-              raise SystemExit("Telegram отклонил публикацию.")
-          print(f'Опубликован пост №{result["result"]["message_id"]}')
-          PY
