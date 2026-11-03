@@ -45,7 +45,8 @@ jobs:
               sowing = re.fullmatch(
                   r"На (\d{1,2} [а-яё]+) озимыми в (?:РФ|России) засеяно "
                   r"(\d+(?:[,.]\d+)?) млн га",
-                  title, re.IGNORECASE,
+                  title,
+                  re.IGNORECASE,
               )
               if sowing:
                   day, area = sowing.groups()
@@ -61,7 +62,8 @@ jobs:
 
               harvest = re.fullmatch(
                   r"В (?:РФ|России) собрано (\d+(?:[,.]\d+)?) млн тонн зерна",
-                  title, re.IGNORECASE,
+                  title,
+                  re.IGNORECASE,
               )
               if harvest:
                   volume = harvest.group(1).replace(".", ",")
@@ -72,6 +74,29 @@ jobs:
                       "Для сравнения с прошлым сезоном важно сверять "
                       "дату сводки и методику учёта.\n\n"
                       "#Урожай #Россия"
+                  )
+
+              export = re.fullmatch(
+                  r"Россия (?:экспортировала|отгрузила на экспорт) "
+                  r"(\d+(?:[,.]\d+)?) (тыс\.?|млн) тонн? "
+                  r"(пшеницы|ячменя|кукурузы|зерна|рапса|сои|льна|нута|чечевицы|гороха) "
+                  r"(за \d{1,2} (?:месяц|месяца|месяцев) \d{4} года|"
+                  r"в (?:январе|феврале|марте|апреле|мае|июне|июле|августе|"
+                  r"сентябре|октябре|ноябре|декабре) \d{4} года)",
+                  title,
+                  re.IGNORECASE,
+              )
+              if export:
+                  amount, unit, crop, period = export.groups()
+                  amount = amount.replace(".", ",")
+                  unit = "тыс." if unit.lower().startswith("тыс") else "млн"
+                  crop = crop.lower()
+                  period = period.lower()
+                  return (
+                      f"🚢 Экспорт {crop} из России — {amount} {unit} тонн\n\n"
+                      f"Россия экспортировала {amount} {unit} тонн {crop} "
+                      f"{period}.\n\n"
+                      "#Экспорт #Россия"
                   )
 
               return None
@@ -133,13 +158,16 @@ jobs:
               data=body,
               headers={"Content-Type": "application/json"},
           )
+
           try:
               with urllib.request.urlopen(request, timeout=30) as response:
                   result = json.load(response)
           except urllib.error.HTTPError as error:
               raise SystemExit(f"Telegram вернул HTTP {error.code}.") from None
           except Exception:
-              raise SystemExit("Ошибка связи. Проверь канал перед повторной отправкой.") from None
+              raise SystemExit(
+                  "Ошибка связи. Проверь канал перед повторной отправкой."
+              ) from None
 
           if not result.get("ok"):
               raise SystemExit("Telegram отклонил публикацию.")
