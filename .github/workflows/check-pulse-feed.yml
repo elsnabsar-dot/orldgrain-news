@@ -1,0 +1,95 @@
+name: Check pulse feed
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Check chickpea and lentil headlines
+        run: |
+          python3 - <<'PY'
+          import re
+          import xml.etree.ElementTree as ET
+          from datetime import datetime
+          from email.utils import parsedate_to_datetime
+          from html.parser import HTMLParser
+          from urllib.request import Request, urlopen
+          from zoneinfo import ZoneInfo
+
+
+          class TitleText(HTMLParser):
+              def __init__(self):
+                  super().__init__()
+                  self.parts = []
+
+              def handle_data(self, data):
+                  self.parts.append(data)
+
+
+          feed = "https://www.zerno.ru/rss.xml"
+          request = Request(feed, headers={"User-Agent": "WorldgrainFeedCheck/1.0"})
+          with urlopen(request, timeout=25) as response:
+              root = ET.fromstring(response.read())
+
+          channel = root.find("channel")
+          if channel is None:
+              raise SystemExit("В ответе сервера отсутствует RSS-канал.")
+
+          items = channel.findall("item")
+          print(f"Всего записей в RSS: {len(items)}")
+          if not items:
+              raise SystemExit("RSS-канал вернул пустой список записей.")
+
+          timezone = ZoneInfo("Europe/Saratov")
+          today = datetime.now(timezone).date()
+          crop = re.compile(
+              r"\b(?:нут(?:а|у|ом|е)?|чечевиц(?:а|ы|е|у|ей|ою))\b",
+              re.IGNORECASE,
+          )
+          mentions = last_7 = last_15 = unknown_date = 0
+
+          for item in items:
+              parser = TitleText()
+              parser.feed(item.findtext("title") or "")
+              parser.close()
+              title = " ".join("".join(parser.parts).split())
+              if not crop.search(title):
+                  continue
+
+              mentions += 1
+              try:
+                  published = parsedate_to_datetime(item.findtext("pubDate") or "")
+                  if published.tzinfo is None:
+                      raise ValueError("Нет часового пояса")
+                  published_day = published.astimezone(timezone).date()
+              except (ValueError, TypeError, OverflowError):
+                  unknown_date += 1
+                  print(f"Дата неизвестна | {title}")
+                  continue
+
+              age = (today - published_day).days
+              if age < 0:
+                  status = "дата в будущем"
+              elif age < 7:
+                  last_7 += 1
+                  last_15 += 1
+                  status = "в окне 7 и 15 дней"
+              elif age < 15:
+                  last_15 += 1
+                  status = "только в окне 15 дней"
+              else:
+                  status = "старше окна 15 дней"
+
+              print(f"{published_day:%d.%m.%Y} | {status} | {title}")
+
+          print()
+          print(f"Заголовков с упоминанием культур: {mentions}")
+          print(f"За 7 календарных дней, включая сегодня: {last_7}")
+          print(f"За 15 календарных дней, включая сегодня: {last_15}")
+          print(f"С неизвестной датой: {unknown_date}")
+          PY
