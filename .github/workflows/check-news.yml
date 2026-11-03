@@ -1,0 +1,36 @@
+name: Check news source
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Preview Zerno.ru feed
+        run: |
+          python3 - <<'PY'
+          import urllib.request
+          import xml.etree.ElementTree as ET
+
+          url = "https://www.zerno.ru/rss.xml"
+          request = urllib.request.Request(url, headers={
+              "User-Agent": "WorldgrainNews/1.0 (RSS reader)"
+          })
+
+          with urllib.request.urlopen(request, timeout=30) as response:
+              root = ET.fromstring(response.read(2_000_000))
+
+          items = root.findall("./channel/item")
+          if not items:
+              raise SystemExit("ERROR: в RSS не найдено новостей")
+
+          for item in items[:5]:
+              print(item.findtext("pubDate", "").strip())
+              print(item.findtext("title", "").strip())
+              print(item.findtext("link", "").strip())
+              print()
+          PY
