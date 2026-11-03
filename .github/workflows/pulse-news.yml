@@ -1,38 +1,10 @@
-name: Pulse news
 
-on:
-  workflow_dispatch:
-  schedule:
-    - cron: '36 15 * * *'
-
-permissions:
-  contents: write
-
-concurrency:
-  group: worldgrain-pulse-news
-  cancel-in-progress: false
-
-jobs:
-  news:
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - name: Prepare chickpea and lentil news
-        env:
-          GH_TOKEN: ${{ github.token }}
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-        run: |
-          python3 - <<'PY'
-          import base64
-          import hashlib
-          import json
-          import os
-          import re
-          import xml.etree.ElementTree as ET
-          from datetime import datetime, timedelta
+    
+  
+          from email.utils import parsedate_to_datetime
           from decimal import Decimal
           from html.parser import HTMLParser
-          from urllib.error import HTTPError
+          from urllib.error import HTTPError, URLError
           from urllib.parse import urlencode, urlsplit
           from urllib.request import Request, urlopen
           from zoneinfo import ZoneInfo
@@ -169,100 +141,24 @@ jobs:
 
               return candidates
 
-          def main():
-              event = os.environ["GITHUB_EVENT_NAME"]
-              preview = event == "workflow_dispatch"
-              if not preview and (
-                  event != "schedule" or os.environ["GITHUB_RUN_ATTEMPT"] != "1"
-              ):
-                  return
 
-              today = datetime.now(ZoneInfo("Europe/Saratov")).date()
-              candidates = read_candidates(today, preview)
-
-              branch = os.environ["GITHUB_REF_NAME"]
-              contents = (
-                  f'{os.environ["GITHUB_API_URL"]}/repos/'
-                  f'{os.environ["GITHUB_REPOSITORY"]}/contents/'
+          def read_agroexport(today, preview):
+              feed = "https://aemcx.ru/feed/"
+              field = "{http://purl.org/rss/1.0/modules/content/}encoded"
+              forecast = re.compile(
+                  r"\bIGC\s+ожидает\s+сокращение\s+мирового\s+"
+                  r"производства\s+чечевицы\b",
+                  re.IGNORECASE,
               )
-              headers = {
-                  "Authorization": "Bearer " + os.environ["GH_TOKEN"],
-                  "Accept": "application/vnd.github+json",
-              }
-              query = "?" + urlencode({"ref": branch})
-              state_url = contents + ".worldgrain-pulse-news.json"
+              request = Request(feed, headers={"User-Agent": "Mozilla/5.0"})
+              with urlopen(request, timeout=25) as response:
+                  root = ET.fromstring(response.read())
+              items = root.findall("./channel/item")
+              if not items:
+                  raise ValueError("Пустая лента")
+              print(f"Агроэкспорт: записей в RSS — {len(items)}")
 
-              def read_history(url):
-                  try:
-                      record = request_json(url + query, headers=headers)
-                      return (
-                          json.loads(base64.b64decode(record["content"])),
-                          record["sha"],
-                      )
-                  except HTTPError as error:
-                      if error.code == 404:
-                          return {}, None
-                      raise SystemExit(
-                          f"GitHub не прочитал журнал: HTTP {error.code}."
-                      ) from None
+              key = "agroexport:igc:lentil:world-production-decline:2026"
+              message = (
+                  "🌱 Мировой рынок чечевицы\n\n"
 
-              history, sha = read_history(state_url)
-              general_history, _ = read_history(contents + ".worldgrain-history.json")
-              available = [
-                  (published, key, url, message)
-                  for key, (published, url, message) in candidates.items()
-                  if key not in history and key not in general_history
-              ]
-              if not available:
-                  print("Свежих подходящих новостей по нуту и чечевице нет.")
-                  return
-
-              published, key, url, message = max(
-                  available, key=lambda item: item[0]
-              )
-              print(f"Для сверки: {url}")
-              if preview:
-                  print("\n" + message)
-                  return
-
-              token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
-              if not token:
-                  raise SystemExit("Отсутствует секрет TELEGRAM_BOT_TOKEN.")
-
-              cutoff = (today - timedelta(days=30)).isoformat()
-              history = {key: day for key, day in history.items() if day >= cutoff}
-              history[key] = published.isoformat()
-              update = {
-                  "branch": branch,
-                  "message": "Update Worldgrain pulse news history",
-                  "content": base64.b64encode(
-                      json.dumps(history, indent=2).encode("utf-8")
-                  ).decode("ascii"),
-              }
-              if sha:
-                  update["sha"] = sha
-              request_json(state_url, method="PUT", headers=headers, payload=update)
-
-              try:
-                  result = request_json(
-                      f"https://api.telegram.org/bot{token}/sendMessage",
-                      method="POST",
-                      payload={
-                          "chat_id": "@worldgrain",
-                          "text": message,
-                          "disable_notification": True,
-                      },
-                  )
-              except HTTPError as error:
-                  raise SystemExit(f"Telegram вернул HTTP {error.code}.") from None
-              except Exception:
-                  raise SystemExit(
-                      "Telegram не подтвердил отправку. Проверь канал."
-                  ) from None
-
-              if not result.get("ok"):
-                  raise SystemExit("Telegram отклонил публикацию.")
-              print(f'Опубликован пост №{result["result"]["message_id"]}')
-
-          main()
-          PY
