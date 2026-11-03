@@ -16,15 +16,21 @@ concurrency:
 jobs:
   prices:
     runs-on: ubuntu-latest
-    timeout-minutes: 4
+    timeout-minutes: 10
     steps:
+      - name: Install browser
+        run: |
+          python3 -m venv "$RUNNER_TEMP/worldgrain-browser"
+          "$RUNNER_TEMP/worldgrain-browser/bin/python" -m pip install playwright
+          "$RUNNER_TEMP/worldgrain-browser/bin/python" -m playwright install --with-deps chromium
+
       - name: Prepare port prices
         env:
           GH_TOKEN: ${{ github.token }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           PRICE_SLOT: ${{ github.event.schedule }}
         run: |
-          python3 - <<'PY'
+          "$RUNNER_TEMP/worldgrain-browser/bin/python" - <<'PY'
           import base64
           import json
           import os
@@ -32,77 +38,78 @@ jobs:
           import urllib.error
           import urllib.request
           from datetime import datetime, timedelta
-          from html.parser import HTMLParser
+          from urllib.parse import urlencode
           from zoneinfo import ZoneInfo
 
-          class PageText(HTMLParser):
-              def __init__(self):
-                  super().__init__()
-                  self.parts = []
-                  self.hidden = None
-
-              def handle_starttag(self, tag, attrs):
-                  if tag in {"script", "style"}:
-                      self.hidden = tag
-
-              def handle_endtag(self, tag):
-                  if tag == self.hidden:
-                      self.hidden = None
-
-              def handle_data(self, data):
-                  if self.hidden is None:
-                      self.parts.append(data)
+          from playwright.sync_api import TimeoutError as BrowserTimeout
+          from playwright.sync_api import sync_playwright
 
           def fetch_json(url, headers, payload=None, method="GET"):
               body = None
               if payload is not None:
                   body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
                   headers = {**headers, "Content-Type": "application/json"}
+
               request = urllib.request.Request(
                   url, data=body, headers=headers, method=method
               )
               with urllib.request.urlopen(request, timeout=25) as response:
                   return json.load(response)
 
-          request = urllib.request.Request(
-              "https://ntbtrade.ru/",
-              headers={"User-Agent": "WorldgrainPrices/1.0"},
-          )
-          with urllib.request.urlopen(request, timeout=25) as response:
-              encoding = response.headers.get_content_charset() or "utf-8"
-              html = response.read(4_000_000).decode(encoding)
+          def read_ntb_page():
+              with sync_playwright() as playwright:
+                  browser = playwright.chromium.launch()
+                  try:
+                      tab = browser.new_page()
+                      tab.goto(
+                          "https://ntbtrade.ru/",
+                          wait_until="domcontentloaded",
+                          timeout=45_000,
+                      )
+                      tab.wait_for_function(
+                          r"""() => {
+                              const text = document.body?.innerText || "";
+                              return /НЗТ/i.test(text) &&
+                                     /НКХП/i.test(text) &&
+                                     /Последнее обновление\s*:\s*\d{2}\.\d{2}\.\d{4}/i.test(text);
+                          }""",
+                          timeout=45_000,
+                      )
+                      return " ".join(tab.locator("body").inner_text().split())
+                  except BrowserTimeout:
+                      raise SystemExit(
+                          "Браузер GitHub не дождался котировок НТБ."
+                      ) from None
+                  finally:
+                      browser.close()
 
-          parser = PageText()
-          parser.feed(html)
-          page = " ".join(" ".join(parser.parts).split())
-
+          page = read_ntb_page()
           price = r"(\d{1,3}(?: \d{3})+|\d{4,6})\s*₽\s*/\s*т"
           basis = (
               r"пшеница\s+12[,.]5\s*%\s*,?\s*CPT\s*,?\s*"
               r"порты ч[её]рного моря\s+без ндс"
           )
+          rail = r"ж\s*[./-]?\s*д\.?"
+
           table = re.search(
               basis
               + r"\s+деметра\s+трейдинг\s+НЗТ\s+авто\s+"
               + price
-              + r"\s+жд\s+"
+              + rf"\s+{rail}\s+"
               + price
               + r"\s+ОЗК\s+НКХП\s+авто\s+"
               + price
-              + r"\s+жд\s+"
+              + rf"\s+{rail}\s+"
               + price,
               page,
               re.IGNORECASE,
           )
+
           if not table:
-              marker = re.search(r"НЗТ|НКХП|пшеница|котировки", page, re.IGNORECASE)
-              if marker:
-                  start = max(0, marker.start() - 200)
-                  print("Фрагмент страницы НТБ:")
-                  print(page[start:start + 2500])
-              else:
-                  print("Начало ответа НТБ:")
-                  print(page[:1200])
+              marker = re.search(r"НЗТ|НКХП", page, re.IGNORECASE)
+              start = max(0, marker.start() - 350) if marker else 0
+              print("Фрагмент страницы НТБ после загрузки в браузере:")
+              print(page[start:start + 1600])
               raise SystemExit("Таблица НТБ не распознана.")
 
           stamp = re.search(
@@ -111,6 +118,7 @@ jobs:
               re.IGNORECASE,
           )
           if not stamp:
+              print(page[table.end():table.end() + 600])
               raise SystemExit("Рядом с котировками не найдена дата обновления.")
 
           quote_date = datetime.strptime(stamp.group(1), "%d.%m.%Y").date()
@@ -141,18 +149,22 @@ jobs:
                   "#Пшеница #Цены"
               )
 
-          if os.environ["GITHUB_EVENT_NAME"] == "workflow_dispatch":
+          event = os.environ["GITHUB_EVENT_NAME"]
+          if event == "workflow_dispatch":
               print(build_post("auto"))
               print("\n" + "─" * 24 + "\n")
               print(build_post("rail"))
               raise SystemExit(0)
 
-          if os.environ["GITHUB_RUN_ATTEMPT"] != "1":
-              print("Повторный запуск пропущен.")
+          if event != "schedule" or os.environ["GITHUB_RUN_ATTEMPT"] != "1":
+              print("Отправка пропущена.")
               raise SystemExit(0)
 
           slots = {"42 7 * * *": "auto", "42 12 * * *": "rail"}
-          mode = slots[os.environ["PRICE_SLOT"]]
+          mode = slots.get(os.environ.get("PRICE_SLOT", ""))
+          if mode is None:
+              raise SystemExit("Неизвестный слот публикации.")
+
           token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
           if not token:
               raise SystemExit("Отсутствует секрет TELEGRAM_BOT_TOKEN.")
@@ -170,7 +182,9 @@ jobs:
           state = {}
           sha = None
           try:
-              stored = fetch_json(state_url + "?ref=" + branch, headers)
+              stored = fetch_json(
+                  state_url + "?" + urlencode({"ref": branch}), headers
+              )
               sha = stored["sha"]
               state = json.loads(base64.b64decode(stored["content"]))
           except urllib.error.HTTPError as error:
@@ -212,7 +226,9 @@ jobs:
           except urllib.error.HTTPError as error:
               raise SystemExit(f"Telegram вернул HTTP {error.code}.") from None
           except Exception:
-              raise SystemExit("Telegram не подтвердил отправку. Проверь канал.") from None
+              raise SystemExit(
+                  "Telegram не подтвердил отправку. Проверь канал."
+              ) from None
 
           if not result.get("ok"):
               raise SystemExit("Telegram отклонил публикацию.")
