@@ -12,22 +12,22 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 3
     steps:
-      - name: Build daily digest
+      - name: Prepare grain news
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
         run: |
           python3 - <<'PY'
           import json
           import os
+          import re
           import urllib.error
           import urllib.request
           import xml.etree.ElementTree as ET
           from datetime import datetime, timedelta
           from html.parser import HTMLParser
-          from urllib.parse import urlsplit
           from zoneinfo import ZoneInfo
 
-          class TitleParser(HTMLParser):
+          class PlainText(HTMLParser):
               def __init__(self):
                   super().__init__()
                   self.parts = []
@@ -35,51 +35,89 @@ jobs:
               def handle_data(self, text):
                   self.parts.append(text)
 
-          def clean_title(raw):
-              parser = TitleParser()
-              parser.feed(raw)
+          def clean_title(value):
+              parser = PlainText()
+              parser.feed(value)
               parser.close()
-              return " ".join("".join(parser.parts).split())[:250]
+              return " ".join("".join(parser.parts).split()).rstrip(".")
 
-          yesterday = datetime.now(ZoneInfo("Europe/Saratov")).date() - timedelta(days=1)
-          date_label = yesterday.strftime("%d.%m.%Y")
-          feed = urllib.request.Request(
+          def editorial_post(title, date_label):
+              sowing = re.fullmatch(
+                  r"На (\d{1,2} [а-яё]+) озимыми в (?:РФ|России) засеяно "
+                  r"(\d+(?:[,.]\d+)?) млн га",
+                  title, re.IGNORECASE,
+              )
+              if sowing:
+                  day, area = sowing.groups()
+                  area = area.replace(".", ",")
+                  return (
+                      f"🌾 Озимая посевная в России — {area} млн га\n\n"
+                      f"К {day} российские аграрии засеяли озимыми "
+                      f"{area} млн гектаров.\n\n"
+                      "Следующий ориентир — итоговая площадь сева и её "
+                      "сравнение с прошлым сезоном.\n\n"
+                      "#Посевная #Россия"
+                  )
+
+              harvest = re.fullmatch(
+                  r"В (?:РФ|России) собрано (\d+(?:[,.]\d+)?) млн тонн зерна",
+                  title, re.IGNORECASE,
+              )
+              if harvest:
+                  volume = harvest.group(1).replace(".", ",")
+                  return (
+                      f"🌾 Уборка зерна в России — {volume} млн тонн\n\n"
+                      f"В сводке от {date_label} указан сбор "
+                      f"{volume} млн тонн зерна по стране.\n\n"
+                      "Для сравнения с прошлым сезоном важно сверять "
+                      "дату сводки и методику учёта.\n\n"
+                      "#Урожай #Россия"
+                  )
+
+              return None
+
+          preview = os.environ["GITHUB_EVENT_NAME"] == "workflow_dispatch"
+          today = datetime.now(ZoneInfo("Europe/Saratov")).date()
+          yesterday = today - timedelta(days=1)
+
+          feed_request = urllib.request.Request(
               "https://www.zerno.ru/rss.xml",
               headers={"User-Agent": "WorldgrainNews/1.0 (RSS reader)"},
           )
-          with urllib.request.urlopen(feed, timeout=30) as response:
+          with urllib.request.urlopen(feed_request, timeout=30) as response:
               root = ET.fromstring(response.read(2_000_000))
 
-          entries = {}
+          candidates = []
           for item in root.findall("./channel/item"):
-              if item.findtext("pubDate", "").strip() != date_label:
+              date_label = item.findtext("pubDate", "").strip()
+              try:
+                  item_date = datetime.strptime(date_label, "%d.%m.%Y").date()
+              except ValueError:
                   continue
-              url = item.findtext("link", "").strip()
-              parsed = urlsplit(url)
-              if parsed.scheme != "https" or parsed.netloc not in {"zerno.ru", "www.zerno.ru"}:
-                  continue
-              if not parsed.path.startswith("/node/") or len(url) > 300:
-                  continue
-              title = clean_title(item.findtext("title", ""))
-              if title:
-                  entries.setdefault(url, title)
 
-          if not entries:
-              print(f"За {date_label} свежих материалов нет. Выпуск пропущен.")
+              if preview:
+                  if not today - timedelta(days=7) <= item_date <= today:
+                      continue
+              elif item_date != yesterday:
+                  continue
+
+              title = clean_title(item.findtext("title", ""))
+              post = editorial_post(title, date_label)
+              if post:
+                  candidates.append((item_date, post))
+
+          if not candidates:
+              print("Подходящих фактов за выбранный период нет.")
               raise SystemExit(0)
 
-          lines = [f"🌾 Первый зерновой · {date_label}", ""]
-          for url, title in list(entries.items())[:5]:
-              lines.extend([f"• {title}", url, ""])
-          lines.append("Источник — Zerno.ru")
-          message = "\n".join(lines)
-
-          if os.environ["GITHUB_EVENT_NAME"] == "workflow_dispatch":
+          _, message = max(candidates, key=lambda entry: entry[0])
+          if preview:
               print(message)
               raise SystemExit(0)
 
           if os.environ["GITHUB_RUN_ATTEMPT"] != "1":
-              raise SystemExit("Повторный запуск остановлен, чтобы не продублировать выпуск.")
+              print("Повторная отправка пропущена.")
+              raise SystemExit(0)
 
           token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
           if not token:
@@ -89,7 +127,6 @@ jobs:
               "chat_id": "@worldgrain",
               "text": message,
               "disable_notification": True,
-              "link_preview_options": {"is_disabled": True},
           }).encode("utf-8")
           request = urllib.request.Request(
               f"https://api.telegram.org/bot{token}/sendMessage",
@@ -102,7 +139,7 @@ jobs:
           except urllib.error.HTTPError as error:
               raise SystemExit(f"Telegram вернул HTTP {error.code}.") from None
           except Exception:
-              raise SystemExit("Ошибка связи с Telegram. Проверь канал.") from None
+              raise SystemExit("Ошибка связи. Проверь канал перед повторной отправкой.") from None
 
           if not result.get("ok"):
               raise SystemExit("Telegram отклонил публикацию.")
