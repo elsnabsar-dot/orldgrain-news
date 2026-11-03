@@ -1,0 +1,212 @@
+name: Grain prices
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '42 7 * * *'
+    - cron: '42 12 * * *'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: worldgrain-prices
+  cancel-in-progress: false
+
+jobs:
+  prices:
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+    steps:
+      - name: Prepare port prices
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          PRICE_SLOT: ${{ github.event.schedule }}
+        run: |
+          python3 - <<'PY'
+          import base64
+          import json
+          import os
+          import re
+          import urllib.error
+          import urllib.request
+          from datetime import datetime, timedelta
+          from html.parser import HTMLParser
+          from zoneinfo import ZoneInfo
+
+          class PageText(HTMLParser):
+              def __init__(self):
+                  super().__init__()
+                  self.parts = []
+                  self.hidden = None
+
+              def handle_starttag(self, tag, attrs):
+                  if tag in {"script", "style"}:
+                      self.hidden = tag
+
+              def handle_endtag(self, tag):
+                  if tag == self.hidden:
+                      self.hidden = None
+
+              def handle_data(self, data):
+                  if self.hidden is None:
+                      self.parts.append(data)
+
+          def fetch_json(url, headers, payload=None, method="GET"):
+              body = None
+              if payload is not None:
+                  body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+                  headers = {**headers, "Content-Type": "application/json"}
+              request = urllib.request.Request(
+                  url, data=body, headers=headers, method=method
+              )
+              with urllib.request.urlopen(request, timeout=25) as response:
+                  return json.load(response)
+
+          request = urllib.request.Request(
+              "https://ntbtrade.ru/",
+              headers={"User-Agent": "WorldgrainPrices/1.0"},
+          )
+          with urllib.request.urlopen(request, timeout=25) as response:
+              encoding = response.headers.get_content_charset() or "utf-8"
+              html = response.read(4_000_000).decode(encoding)
+
+          parser = PageText()
+          parser.feed(html)
+          page = " ".join(" ".join(parser.parts).split())
+
+          price = r"(\d{1,3}(?: \d{3})+|\d{4,6})\s*₽\s*/\s*т"
+          basis = (
+              r"пшеница\s+12[,.]5\s*%\s*,?\s*CPT\s*,?\s*"
+              r"порты ч[её]рного моря\s+без ндс"
+          )
+          table = re.search(
+              basis
+              + r"\s+деметра\s+трейдинг\s+НЗТ\s+авто\s+"
+              + price
+              + r"\s+жд\s+"
+              + price
+              + r"\s+ОЗК\s+НКХП\s+авто\s+"
+              + price
+              + r"\s+жд\s+"
+              + price,
+              page,
+              re.IGNORECASE,
+          )
+          if not table:
+              raise SystemExit("Таблица НТБ не распознана. Проверь формат страницы.")
+
+          stamp = re.search(
+              r"Последнее обновление\s*:\s*(\d{2}\.\d{2}\.\d{4})",
+              page[table.end():table.end() + 600],
+              re.IGNORECASE,
+          )
+          if not stamp:
+              raise SystemExit("Рядом с котировками не найдена дата обновления.")
+
+          quote_date = datetime.strptime(stamp.group(1), "%d.%m.%Y").date()
+          today = datetime.now(ZoneInfo("Europe/Saratov")).date()
+          if not today - timedelta(days=2) <= quote_date <= today:
+              print(f"Котировки от {quote_date:%d.%m.%Y} вне окна свежести.")
+              raise SystemExit(0)
+
+          nzt_auto, nzt_rail, nkhp_auto, nkhp_rail = (
+              int(value.replace(" ", "")) for value in table.groups()
+          )
+          quotes = {
+              "auto": ("автодоставка", [nzt_auto, nkhp_auto]),
+              "rail": ("железнодорожная доставка", [nzt_rail, nkhp_rail]),
+          }
+
+          def rubles(value):
+              return f"{value:,}".replace(",", " ")
+
+          def build_post(mode):
+              transport, (nzt, nkhp) = quotes[mode]
+              return (
+                  f"🌾 Пшеница 12,5% · {transport}\n\n"
+                  f"Портовые закупочные котировки на {quote_date:%d.%m.%Y}.\n\n"
+                  f"• НЗТ — {rubles(nzt)} ₽/т\n"
+                  f"• НКХП — {rubles(nkhp)} ₽/т\n\n"
+                  "Базис CPT, порты Чёрного моря. Цены без НДС.\n\n"
+                  "#Пшеница #Цены"
+              )
+
+          if os.environ["GITHUB_EVENT_NAME"] == "workflow_dispatch":
+              print(build_post("auto"))
+              print("\n" + "─" * 24 + "\n")
+              print(build_post("rail"))
+              raise SystemExit(0)
+
+          if os.environ["GITHUB_RUN_ATTEMPT"] != "1":
+              print("Повторный запуск пропущен.")
+              raise SystemExit(0)
+
+          slots = {"42 7 * * *": "auto", "42 12 * * *": "rail"}
+          mode = slots[os.environ["PRICE_SLOT"]]
+          token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+          if not token:
+              raise SystemExit("Отсутствует секрет TELEGRAM_BOT_TOKEN.")
+
+          branch = os.environ["GITHUB_REF_NAME"]
+          state_url = (
+              f'{os.environ["GITHUB_API_URL"]}/repos/{os.environ["GITHUB_REPOSITORY"]}'
+              "/contents/.worldgrain-prices.json"
+          )
+          headers = {
+              "Authorization": "Bearer " + os.environ["GH_TOKEN"],
+              "Accept": "application/vnd.github+json",
+          }
+
+          state = {}
+          sha = None
+          try:
+              stored = fetch_json(state_url + "?ref=" + branch, headers)
+              sha = stored["sha"]
+              state = json.loads(base64.b64decode(stored["content"]))
+          except urllib.error.HTTPError as error:
+              if error.code != 404:
+                  raise SystemExit(f"GitHub вернул HTTP {error.code}.") from None
+
+          values = quotes[mode][1]
+          if state.get(mode, {}).get("prices") == values:
+              print("Цены совпадают с предыдущим выпуском.")
+              raise SystemExit(0)
+
+          state[mode] = {
+              "prices": values,
+              "quote_date": quote_date.isoformat(),
+          }
+          update = {
+              "branch": branch,
+              "message": "Update Worldgrain price history",
+              "content": base64.b64encode(
+                  json.dumps(state, indent=2).encode("utf-8")
+              ).decode("ascii"),
+          }
+          if sha:
+              update["sha"] = sha
+
+          fetch_json(state_url, headers, update, method="PUT")
+
+          try:
+              result = fetch_json(
+                  "https://api.telegram.org/bot" + token + "/sendMessage",
+                  {},
+                  {
+                      "chat_id": "@worldgrain",
+                      "text": build_post(mode),
+                      "disable_notification": True,
+                  },
+                  method="POST",
+              )
+          except urllib.error.HTTPError as error:
+              raise SystemExit(f"Telegram вернул HTTP {error.code}.") from None
+          except Exception:
+              raise SystemExit("Telegram не подтвердил отправку. Проверь канал.") from None
+
+          if not result.get("ok"):
+              raise SystemExit("Telegram отклонил публикацию.")
+          print(f'Опубликован пост №{result["result"]["message_id"]}')
+          PY
