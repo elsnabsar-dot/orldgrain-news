@@ -189,22 +189,45 @@ jobs:
               with urlopen(request, timeout=30) as response:
                   return json.load(response)
 
-          request = Request(SOURCE, headers={"User-Agent": "Mozilla/5.0"})
-          with urlopen(request, timeout=30) as response:
-              html = response.read(4_000_001)
-          if len(html) > 4_000_000:
-              raise SystemExit("Страница объявлений превысила лимит размера.")
-
-          soup = BeautifulSoup(html, "html.parser")
-          links = soup.select("a.tovar-list__card-link[href]")
-          if not links:
-              raise SystemExit("Карточки объявлений не найдены.")
-
+                   sources = (
+              SOURCE,
+              "https://agroru.com/doska/nut/",
+              "https://agroru.com/doska/chechevica/",
+          )
           offers = {}
-          for link in links:
-              offer = parse_offer(link)
-              if offer:
-                  offers.setdefault(offer["id"], offer)
+          pages_read = 0
+
+          for source in sources:
+              try:
+                  request = Request(source, headers={"User-Agent": "Mozilla/5.0"})
+                  with urlopen(request, timeout=25) as response:
+                      html = response.read(4_000_001)
+              except OSError as error:
+                  print(f"Страница недоступна: {source} ({type(error).__name__})")
+                  continue
+
+              if len(html) > 4_000_000:
+                  print(f"Страница превысила лимит размера: {source}")
+                  continue
+
+              soup = BeautifulSoup(html, "html.parser")
+              links = soup.select("a.tovar-list__card-link[href]")
+              if not links:
+                  print(f"Карточки не найдены: {source}")
+                  continue
+
+              pages_read += 1
+              matched = 0
+              for link in links:
+                  offer = parse_offer(link)
+                  if offer:
+                      matched += 1
+                      offers.setdefault(offer["id"], offer)
+
+              print(f"{source} — карточек: {len(links)}, прошли фильтр: {matched}")
+
+          if not pages_read:
+              raise SystemExit("Не удалось прочитать карточки ни с одной страницы.")
 
           preview = os.environ["GITHUB_EVENT_NAME"] == "workflow_dispatch"
           if not preview and os.environ.get("GITHUB_RUN_ATTEMPT") != "1":
