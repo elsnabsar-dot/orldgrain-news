@@ -1,0 +1,110 @@
+name: Daily grain news
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '17 5 * * *'
+
+permissions: {}
+
+jobs:
+  digest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Build daily digest
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import urllib.error
+          import urllib.request
+          import xml.etree.ElementTree as ET
+          from datetime import datetime, timedelta
+          from html.parser import HTMLParser
+          from urllib.parse import urlsplit
+          from zoneinfo import ZoneInfo
+
+          class TitleParser(HTMLParser):
+              def __init__(self):
+                  super().__init__()
+                  self.parts = []
+
+              def handle_data(self, text):
+                  self.parts.append(text)
+
+          def clean_title(raw):
+              parser = TitleParser()
+              parser.feed(raw)
+              parser.close()
+              return " ".join("".join(parser.parts).split())[:250]
+
+          yesterday = datetime.now(ZoneInfo("Europe/Saratov")).date() - timedelta(days=1)
+          date_label = yesterday.strftime("%d.%m.%Y")
+          feed = urllib.request.Request(
+              "https://www.zerno.ru/rss.xml",
+              headers={"User-Agent": "WorldgrainNews/1.0 (RSS reader)"},
+          )
+          with urllib.request.urlopen(feed, timeout=30) as response:
+              root = ET.fromstring(response.read(2_000_000))
+
+          entries = {}
+          for item in root.findall("./channel/item"):
+              if item.findtext("pubDate", "").strip() != date_label:
+                  continue
+              url = item.findtext("link", "").strip()
+              parsed = urlsplit(url)
+              if parsed.scheme != "https" or parsed.netloc not in {"zerno.ru", "www.zerno.ru"}:
+                  continue
+              if not parsed.path.startswith("/node/") or len(url) > 300:
+                  continue
+              title = clean_title(item.findtext("title", ""))
+              if title:
+                  entries.setdefault(url, title)
+
+          if not entries:
+              print(f"За {date_label} свежих материалов нет. Выпуск пропущен.")
+              raise SystemExit(0)
+
+          lines = [f"🌾 Первый зерновой · {date_label}", ""]
+          for url, title in list(entries.items())[:5]:
+              lines.extend([f"• {title}", url, ""])
+          lines.append("Источник — Zerno.ru")
+          message = "\n".join(lines)
+
+          if os.environ["GITHUB_EVENT_NAME"] == "workflow_dispatch":
+              print(message)
+              raise SystemExit(0)
+
+          if os.environ["GITHUB_RUN_ATTEMPT"] != "1":
+              raise SystemExit("Повторный запуск остановлен, чтобы не продублировать выпуск.")
+
+          token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+          if not token:
+              raise SystemExit("Секрет TELEGRAM_BOT_TOKEN отсутствует.")
+
+          body = json.dumps({
+              "chat_id": "@worldgrain",
+              "text": message,
+              "disable_notification": True,
+              "link_preview_options": {"is_disabled": True},
+          }).encode("utf-8")
+          request = urllib.request.Request(
+              f"https://api.telegram.org/bot{token}/sendMessage",
+              data=body,
+              headers={"Content-Type": "application/json"},
+          )
+          try:
+              with urllib.request.urlopen(request, timeout=30) as response:
+                  result = json.load(response)
+          except urllib.error.HTTPError as error:
+              raise SystemExit(f"Telegram вернул HTTP {error.code}.") from None
+          except Exception:
+              raise SystemExit("Ошибка связи с Telegram. Проверь канал.") from None
+
+          if not result.get("ok"):
+              raise SystemExit("Telegram отклонил публикацию.")
+          print(f'Опубликован пост №{result["result"]["message_id"]}')
+          PY
