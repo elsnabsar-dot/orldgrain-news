@@ -1,0 +1,60 @@
+name: Test oilseed card
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: worldgrain-oilseed-prices
+  cancel-in-progress: false
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install image tools
+        run: |
+          python -m pip install Pillow==11.3.0
+          sudo apt-get update -qq
+          sudo apt-get install -y fonts-dejavu-core
+
+      - name: Build preview
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python oilseed_card.py
+
+      - name: Send test card to channel
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+        run: |
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          from oilseed_card import send_photo
+
+          if os.environ.get("GITHUB_RUN_ATTEMPT") != "1":
+              raise SystemExit("Повтор запуска пропущен.")
+
+          caption_file = Path("oilseed-preview/caption.html")
+          if not caption_file.exists():
+              raise SystemExit("Карточка не создана. Отправка остановлена.")
+
+          token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+          if not token:
+              raise SystemExit("Отсутствует TELEGRAM_BOT_TOKEN.")
+
+          caption = "🧪 Тест оформления\n\n" + caption_file.read_text(
+              encoding="utf-8"
+          )
+          message_id = send_photo(token, caption)
+          print(f"Тест опубликован: https://t.me/worldgrain/{message_id}")
+          PY
