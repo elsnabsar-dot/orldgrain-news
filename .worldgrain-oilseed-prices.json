@@ -1,4 +1,13 @@
 {
   "podsolnechnik_2026-desc-aston_povolzhe_buzuluk": 23500,
-  "raps-desc-aston_g_morozovsk": 26000
+  "raps-desc-aston_g_morozovsk": 26000,
+  "_pending": {
+    "prices": {
+      "podsolnechnik_2026-desc-aston_povolzhe_buzuluk": 25000,
+      "raps-desc-aston_g_morozovsk": 26000
+    },
+    "price_date": "28.11.2026",
+    "price_time": "08:00",
+    "run_id": "46141854022"
+  }
 }
